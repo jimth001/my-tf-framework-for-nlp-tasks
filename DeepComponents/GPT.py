@@ -20,7 +20,7 @@ def model(hparams, X, past=None, scope='model', reuse=False):
             presents.append(present)
         presents = tf.stack(presents, axis=1)
         presents.set_shape(past_shape(hparams=hparams, batch_size=None))
-        results['present']=presents
+        results['presents'] = presents
         h = norm(h, 'ln_f')
         # Language model loss.  Do tokens <n predict token n?
         h_flat = tf.reshape(h, [batch * sequence, hparams.n_embd])
