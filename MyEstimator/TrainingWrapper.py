@@ -38,6 +38,8 @@ class multi_gpu_trainer:
         self.config['learning_rate'] = 1e-4
         self.config['weight_decay'] = 1e-10
         self.config['accum_var_scope'] = 'accum_var_scope'
+        self.config['allow_soft_placement'] = True
+        self.config['log_device_placement'] = False
         self.model_fn = model_fn
         self.graph = tf.Graph()
         # vars for data parallel:
@@ -78,7 +80,7 @@ class multi_gpu_trainer:
         else:  # SGD is default
             return tf.train.GradientDescentOptimizer(learning_rate=self.config['learning_rate'])
 
-    def build_data_parallel_training_graph(self,allow_gradient_accumulation:bool):
+    def build_data_parallel_training_graph(self, allow_gradient_accumulation: bool):
         with self.graph.as_default():
             self.global_step = tf.Variable(1, name='global_step', trainable=False)
             self.opt = self.get_init_optimizer()
@@ -115,14 +117,14 @@ class multi_gpu_trainer:
     def build_data_parallel_inferring_graph(self):
         with self.graph.as_default():
             self.global_step = tf.Variable(1, name='global_step', trainable=False)
-            self.predictions_ops = []
+            self.predictions_ops = {}
             for i in range(0, len(self.config['device_id'])):
                 with tf.variable_scope(tf.get_variable_scope(), reuse=(i != 0)):
-                    with tf.device('/gpu:%d' % self.config['device_id']):
+                    with tf.device('/gpu:%d' % self.config['device_id'][i]):
                         with tf.name_scope('parallel_%d' % i) as scope:
                             self.model_fn.create_placeholders(i)
                             pred = self.model_fn.build_inferring_graph(group_id=i)
-                            self.predictions_ops.append(pred)
+                            self.predictions_ops['beam_search_seqs'] = pred
 
     def load_checkpoint(self, path, logging) -> Dict[str, Any]:
         """
@@ -147,7 +149,7 @@ class multi_gpu_trainer:
         self.print_and_logging(content="Total pre-trained variables size: %d" % total_size, logging=logging)
         return values
 
-    def create_session_init_and_print_all_vars(self, max_to_save, pretrained_ckpt, logging=False, debug_mode=False):
+    def create_session_init_and_print_all_vars(self, max_to_save, pretrained_ckpt, logging=False):
         # Print parameters
         with self.graph.as_default():
             all_trainable_weights = {v.name: v for v in tf.trainable_variables()}
@@ -181,7 +183,8 @@ class multi_gpu_trainer:
             self.print_and_logging("Total stored variables size: %d" % total_size, logging=logging)
             if len(self.vars_to_save) > 0:
                 self.saver = tf.train.Saver(self.vars_to_save, max_to_keep=max_to_save)
-            config = tf.ConfigProto(log_device_placement=debug_mode)
+            config = tf.ConfigProto(allow_soft_placement=self.config['allow_soft_placement'],
+                                    log_device_placement=self.config['log_device_placement'])
             config.gpu_options.allow_growth = True
             sess = tf.Session(graph=self.graph, config=config)
             # raw_init
@@ -330,22 +333,20 @@ class multi_gpu_trainer:
                     for i in range(0, yu % device_num):
                         sp_steps_data_num[i] += 1
             # calculate predictions
-            ret_predictions = []
+            ret_predictions = None
             for i in range(0, normal_steps):
                 feed_dict.clear()
                 for j in range(0, device_num):
                     feed_dict.update(
                         test_data_stream.get_feed_dict(self.model_fn.placeholder_groups[j], size=mini_batch))
                 result = sess.run(self.predictions_ops, feed_dict=feed_dict, options=run_options)
-                for k in range(0, len(result)):
-                    ret_predictions += result[k]
+                ret_predictions = self.model_fn.merge_batch_prediction_result(result, ret_predictions)
             feed_dict.clear()
             for j in range(0, device_num):
                 feed_dict.update(
                     test_data_stream.get_feed_dict(self.model_fn.placeholder_groups[j], size=sp_steps_data_num[j]))
-            result = sess.run(self.losses_to_report[1], feed_dict=feed_dict, options=run_options)
-            for k in range(0, len(result)):
-                ret_predictions += result[k]
+            result = sess.run(self.predictions_ops, feed_dict=feed_dict, options=run_options)
+            ret_predictions = self.model_fn.merge_batch_prediction_result(result, ret_predictions)
         assert test_data_stream.dataset_size == test_data_stream.low, 'data allocation may be wrong'
         test_data_stream.reset_feeding_status()
         return ret_predictions
@@ -374,7 +375,7 @@ class multi_gpu_trainer:
         if not os.path.exists(ckpt_dir):
             os.makedirs(ckpt_dir)
         self.log_file = open(ckpt_dir + 'log-%s.txt' % (get_time_stamp()), 'w', encoding='utf-8')
-        if batch_size==mini_batch*len(self.config['device_id']):
+        if batch_size == mini_batch * len(self.config['device_id']):
             self.build_data_parallel_training_graph(allow_gradient_accumulation=False)
         else:
             self.build_data_parallel_training_graph(allow_gradient_accumulation=True)
@@ -426,24 +427,19 @@ class multi_gpu_trainer:
             step += 1
         print('all work has finished')
 
-    def inferring(self, data_path, ckpt_dir, batch_size=64, mini_batch=16, is_tsv_mode=True, logging=False):
-        device_num = len(self.config['device_id'])
-        assert batch_size % device_num == 0
-        assert batch_size >= mini_batch * device_num and batch_size % (mini_batch * device_num) == 0
+    def inferring(self, data_stream: DataStream, ckpt_dir, mini_batch=16, logging=False):
         assert os.path.exists(ckpt_dir)
         assert tf.train.latest_checkpoint(ckpt_dir) is not None
         if logging:
             self.log_file = open(ckpt_dir + 'infer_log-%s.txt' % (get_time_stamp()), 'w', encoding='utf-8')
-        # create datastream
-        data_stream = DataStream(data_path, placeholder_meta_data=self.model_fn.config['placeholders'],
-                                  func_for_task_specific_processing=self.model_fn.process_origin_data_for_placeholders,
-                                  shuffle_each_epoch=True, round_feeding=True, in_tsv_mode=is_tsv_mode)
+        # set vocab size for modelfn
+        self.model_fn.set_vocab_size(data_stream.text_index_encoder.get_vocab_size())
         self.build_data_parallel_inferring_graph()
-        sess=self.create_session_init_and_print_all_vars(max_to_save=1,pretrained_ckpt=None,logging=logging,debug_mode=False)
-        self.restore_model(sess=sess,ckpt_dir=ckpt_dir,logging=logging)
+        sess = self.create_session_init_and_print_all_vars(max_to_save=1, pretrained_ckpt=None, logging=logging)
+        self.restore_model(sess=sess, ckpt_dir=ckpt_dir, logging=logging)
         run_options = tf.RunOptions(report_tensor_allocations_upon_oom=True)
-        return self.predict_for_one_dataset(sess=sess,test_data_stream=data_stream,mini_batch=mini_batch,run_options=run_options)
-
+        return self.predict_for_one_dataset(sess=sess, test_data_stream=data_stream, mini_batch=mini_batch,
+                                            run_options=run_options)
 
     def print_and_logging(self, content: str, logging=True):
         tf.logging.info(content)
