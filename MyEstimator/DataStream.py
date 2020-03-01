@@ -59,7 +59,7 @@ def load_tsv_corpus(path, placeholders: Dict[str, PlaceholderMetaData]):
                 #assert len(pls_name) == len(placeholders)
                 #assert len(pls_name) == len(set(pls_name))
                 for n in pls_name:
-                    assert n in placeholders
+                    assert n in placeholders, '%s is not a placeholder\'s name' % n
                     data[n] = []
             else:
                 ld = line.strip().split('\t')
@@ -188,19 +188,21 @@ class DataStream:
             l = input_len[i]
             mask_list[i] = mask_list[i] + [0.0] * (max_len - l)"""
 
-    def get_feed_dict(self, one_group_placeholders: Dict[str, tf.placeholder], size):
+    def get_feed_dict(self, one_group_placeholders: Dict[str, tf.placeholder], size,
+                      losses_and_data_mapping: Dict[str, List[str]] or None = None):
         feed_dict = {}
-        for n in one_group_placeholders.keys():
+        size_to_fetch = size
+        for n in self.processed_data.keys():
             feed_dict[one_group_placeholders[n]] = []
         if self.round_feeding:
             while size > 0:
                 if self.low + size <= self.dataset_size:
-                    for n in one_group_placeholders.keys():
+                    for n in self.processed_data.keys():
                         feed_dict[one_group_placeholders[n]] += self.processed_data[n][self.low:self.low + size]
                     self.low += size
                     size = 0
                 else:
-                    for n in one_group_placeholders.keys():
+                    for n in self.processed_data.keys():
                         feed_dict[one_group_placeholders[n]] += self.processed_data[n][self.low:]
                     size = size - (self.dataset_size - self.low)
                     self.low = 0
@@ -208,17 +210,25 @@ class DataStream:
                     if self.shuffle_each_epoch:
                         self.shuffle_data(self.processed_data)
         else:
-            for n in one_group_placeholders.keys():
+            for n in self.processed_data.keys():
                 feed_dict[one_group_placeholders[n]] += self.processed_data[n][self.low:self.low + size]
             self.low+=size
             if self.low>=self.dataset_size:
                 self.epoch+=1
         # padding sequence:(len has been already calculated in func_for_task_specific_processing)
-        for key in one_group_placeholders.keys():
+        for key in self.processed_data.keys():
             if self.placeholder_meta_data[key].type == PlaceholderType.Text or \
                     self.placeholder_meta_data[key].type == PlaceholderType.TextTargMask or \
                     self.placeholder_meta_data[key].type == PlaceholderType.TextAttnMask:
                 feed_dict[one_group_placeholders[key]], _len = self.padding_batch(feed_dict[one_group_placeholders[key]])
+        # process for batch information, such as batch size:
+        for key in self.placeholder_meta_data.keys():
+            if self.placeholder_meta_data[key].type == PlaceholderType.BatchSize:
+                if self.low >= self.dataset_size:
+                    batch_size = size_to_fetch - (self.dataset_size - self.low)
+                else:
+                    batch_size = size_to_fetch
+                feed_dict[one_group_placeholders[key]] = batch_size
         return feed_dict
 
     def get_all_configs(self):
