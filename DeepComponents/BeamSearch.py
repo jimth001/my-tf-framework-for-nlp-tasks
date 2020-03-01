@@ -12,6 +12,7 @@ import tensorflow as tf
 from collections import namedtuple
 from tensorflow.python.util import nest
 from DeepComponents.common_ops import *
+from typing import Callable
 
 class BeamSearchState(namedtuple("BeamSearchState",
                                  ("inputs", "state", "finish"))):
@@ -231,8 +232,25 @@ def beam_search(func, state, batch_size, beam_size, max_length, alpha,
     return final_seqs, final_scores
 
 
-def create_inference_graph(init_seqs, state, step_fn, hparams, decode_length, batch_size, beam_size, decode_alpha, eos_id,
+def create_inference_graph(init_seqs, state, step_fn: Callable, hparams, decode_length, batch_size, beam_size,
+                           decode_alpha, eos_id,
                            ensemble, concat_state_dim, scopes_for_ensemble=None):
+    """
+    create beam search graph for seq2seq model
+    :param init_seqs:
+    :param state:
+    :param step_fn: callable(model_config,input_token,state,scope)
+    :param hparams:
+    :param decode_length:
+    :param batch_size:
+    :param beam_size:
+    :param decode_alpha:
+    :param eos_id:
+    :param ensemble:
+    :param concat_state_dim:
+    :param scopes_for_ensemble:
+    :return:
+    """
     tiled_context_state = nest.map_structure(
         lambda x:tile_to_beam_size(x,beam_size),
         state
