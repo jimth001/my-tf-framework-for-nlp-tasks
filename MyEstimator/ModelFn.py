@@ -13,6 +13,7 @@ class PlaceholderType(Enum):
     TextLength = 4
     TextAttnMask = 5
     TextTargMask = 6
+    BatchSize = 7
 
 class PlaceholderMetaData():
     def __init__(self,type:PlaceholderType,dtype,shape,from_file_name=None,Ref=None):
@@ -56,6 +57,10 @@ class ModelFn:
 
     @abstractmethod
     def vars_mapping_for_loading_transfer_param(self,vars_to_store:List[tf.Variable])->Dict[str,str]:
+        pass
+
+    @abstractmethod
+    def merge_batch_prediction_result(self, new_batch_result: Dict[str, Any], previous_result: Dict[str, Any] or None):
         pass
 
     @abstractmethod
