@@ -1,5 +1,6 @@
 from TextPreprocessing.file_api import read_file_lines,write_file_lines
-base_path='../data/family_relationship/'
+
+base_path = '../data/my_s2s_test_data/'
 input='informal.txt'
 target='formal.txt'
 
