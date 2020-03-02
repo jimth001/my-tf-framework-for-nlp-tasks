@@ -360,10 +360,10 @@ class multi_gpu_trainer:
         assert batch_size >= mini_batch * device_num and batch_size % (mini_batch * device_num) == 0
         # create datastream
         train_stream = DataStream(train_data_path, placeholder_meta_data=self.model_fn.config['placeholders'],
-                                  func_for_task_specific_processing=self.model_fn.process_origin_data_for_placeholders,
+                                  func_for_task_specific_preprocessing=self.model_fn.process_origin_data_for_placeholders,
                                   shuffle_each_epoch=True, round_feeding=True, in_tsv_mode=is_tsv_mode)
         dev_stream = DataStream(dev_data_path, placeholder_meta_data=self.model_fn.config['placeholders'],
-                                func_for_task_specific_processing=self.model_fn.process_origin_data_for_placeholders,
+                                func_for_task_specific_preprocessing=self.model_fn.process_origin_data_for_placeholders,
                                 shuffle_each_epoch=False, round_feeding=False, in_tsv_mode=is_tsv_mode)
         assert type(train_stream.text_index_encoder) == type(
             dev_stream.text_index_encoder), 'bpe tool must be same for train and dev'
