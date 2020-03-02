@@ -1,7 +1,7 @@
 from DeepComponents.GPTEncoder import Encoder
 from DeepComponents.TransformerBlock import default_hparams
 from MyEstimator.DataStream import DataStream
-from MyEstimator.TrainingWrapper import multi_gpu_trainer
+from MyEstimator.ModelWrapper import multi_gpu_trainer
 from Models.GPTModel import GPTModel
 from TextPreprocessing.gpt_bpe_tool import get_encoder, Encoder
 
@@ -24,7 +24,7 @@ def test():
     model.config['beam_size'] = 8
     model.config['decode_alpha'] = 0.6
     data_stream = DataStream('./data/my_s2s_test_data/test2.tsv', placeholder_meta_data=model.config['placeholders'],
-                             func_for_task_specific_processing=model.process_origin_data_for_placeholders,
+                             func_for_task_specific_preprocessing=model.process_origin_data_for_placeholders,
                              shuffle_each_epoch=False, round_feeding=False, in_tsv_mode=True)
     model.config['eos_id'] = data_stream.text_index_encoder.eos_id
     my_estimator = multi_gpu_trainer(device_id=[0], model_fn=model)
