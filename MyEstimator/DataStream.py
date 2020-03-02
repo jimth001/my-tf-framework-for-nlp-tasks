@@ -11,9 +11,9 @@ import tensorflow as tf
 
 def load_txt_corpus(path, data_type: PlaceholderType):
     """
-    load data for one placeholder
+    load txt data for one placeholder
     :param path:
-    :param data_type:
+    :param data_type: A PlaceholderType object. Support str, int and float.
     :return:
     """
     lines = []
@@ -30,14 +30,18 @@ def load_txt_corpus(path, data_type: PlaceholderType):
     return lines
 
 
-def load_tsv_corpus(path, placeholders: Dict[str, PlaceholderMetaData]):
+def load_tsv_corpus(path, placeholders: Dict[str, PlaceholderMetaData]) -> Dict[str, List[str]]:
     """
-    load tsv data for all placeholders
-    In this way, we can first check if the data and the placeholders are matched.
+    load tsv data for all placeholders (RECOMMENDED).
+    tsv format:(\t split)
+    placeholder_name1   placeholder_name2   ...
+    sample_1_data_1  sample_1_data_2    ...
+    sample_2_data_1  sample_2_data_2    ...
+    ......
+    format ended
     :param path: the path of the tsv file
-    :return: a dict whose keys are placeholders' name, and the values are the data.
+    :return: {placeholder_name1:List_1, ...}: A dict whose keys are placeholders' name, and the values are the data.
     """
-
     def convert_type(text_data, type):
         if type == PlaceholderType.Text:
             return text_data
@@ -56,8 +60,6 @@ def load_tsv_corpus(path, placeholders: Dict[str, PlaceholderMetaData]):
             if first:
                 first = False
                 pls_name = line.strip().split('\t')
-                #assert len(pls_name) == len(placeholders)
-                #assert len(pls_name) == len(set(pls_name))
                 for n in pls_name:
                     assert n in placeholders, '%s is not a placeholder\'s name' % n
                     data[n] = []
@@ -74,7 +76,7 @@ class DataStream:
     If some task do not need eos, drop it in func_for_task_specific_processing.
     """
     def __init__(self, files_base_path, placeholder_meta_data: Dict[str, PlaceholderMetaData],
-                 *, func_for_task_specific_processing: ModelFn.process_origin_data_for_placeholders,
+                 *, func_for_task_specific_preprocessing: ModelFn.process_origin_data_for_placeholders,
                  text2index_dictionary_path='./data/bpe_codes/', in_tsv_mode=True,
                  text_preprocessor=get_text_processor(), text2index_tool=get_encoder,
                  shuffle_each_epoch=False, round_feeding=True):
@@ -82,9 +84,10 @@ class DataStream:
         :param files_base_path: For tsv mode. it is the path of tsv file; for txt mode, it is the parent directory of txt files.
                 The name of txt file is in placeholder_meta_data
         :param placeholder_meta_data:
-        :param func_for_task_specific_processing: to create data for placeholders which has "Ref"
+        :param func_for_task_specific_preprocessing: to create data for placeholders which has "Ref"
         :param text2index_dictionary_path: bpe codes path
         :param text_preprocessor: an object for preprocess, such as normalization, correcting spelling errors and so on.
+                Should implement the interface: pre_process_doc(doc:str)->str, otherwise you should modify self.text_preprocessing
                 We apply a default text_preprocessor--ekphrasis.
         :param text2index_tool: an object for bpe encoding and decoding. We use gpt's bpe tool as default.
         :param shuffle_each_epoch: if true, the dataset will be shuffled at the start of each epoch.
@@ -108,15 +111,15 @@ class DataStream:
         # text preprocess and 2index:
         self.text_preprocessor = text_preprocessor
         self.text_index_encoder = text2index_tool(text2index_dictionary_path)
-        self.append_eos = True#do not change this.
+        self.append_eos = True  # do not change this. If you do not need eos, drop it in your modelfn.func_for_task_specific_processing
         for n in data.keys():
             if placeholder_meta_data[n].type == PlaceholderType.Text:
                 text = self.text_preprocessing(data[n])
                 data[n] = self.text2index(text)
         self.ori_data = data
         self.placeholder_meta_data = placeholder_meta_data
-        # task specific processing:
-        self.processed_data = func_for_task_specific_processing(data)
+        # task specific preprocessing:
+        self.processed_data = func_for_task_specific_preprocessing(data)
         # vars for iter:
         self.low = 0
         self.epoch = 1
@@ -180,18 +183,28 @@ class DataStream:
         new_in = pad_sequences(input_list, padding='post', value=0)
         return new_in, in_len
 
-    """def padding_for_target_mask(self, mask_list, input_len):
-        batch_size = len(mask_list)
-        assert batch_size == len(input_len)
-        max_len = max(input_len)
-        for i in range(0, batch_size):
-            l = input_len[i]
-            mask_list[i] = mask_list[i] + [0.0] * (max_len - l)"""
-
     def get_feed_dict(self, one_group_placeholders: Dict[str, tf.placeholder], size,
-                      losses_and_data_mapping: Dict[str, List[str]] or None = None):
+                      op_name_to_run_and_target_data_name: Dict[str, List[str]]):
+        """
+        An example for helping understand what self.get_feed_dict do:
+        :param one_group_placeholders: {data1:tf.placeholder,data2:tf.placeholder,data3:tf.placeholder,
+                                         batch_size:tf.placeholder}
+        :param size: 10
+        :param op_name_to_run_and_target_data_name: {loss1:[data1,data2,batch_size]}
+        self.processed_data={data1:[xx,...],data2:[xx,...],data3:[xx,...]}
+        self.placeholder_meta_data={data1:PlaceholderMetaData,data2:PlaceholderMetaData,data3:PlaceholderMetaData,
+                                    batch_size:PlaceholderMetaData}
+        Process steps:
+        1. squeeze needed data names to a set: data_names_to_fetch={data1,data2,batch_size}
+        2. split data_names_to_fetch into two sets: data_included={data1,data2}, data_excluded={batch_size}
+        3. check if elements in data_excluded are all batch information
+        4. fetch_data for data_included
+        :return: {data1:[x1,...,x10],data2:[x1,...,x10]}
+        """
         feed_dict = {}
         size_to_fetch = size
+        data_names_to_fetch = {}
+
         for n in self.processed_data.keys():
             feed_dict[one_group_placeholders[n]] = []
         if self.round_feeding:

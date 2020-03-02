@@ -1,14 +1,14 @@
 from DeepComponents.GPTEncoder import Encoder
 from DeepComponents.TransformerBlock import default_hparams
 from MyEstimator.DataStream import DataStream
-from MyEstimator.ModelWrapper import multi_gpu_trainer
+from MyEstimator.ModelWrapper import ModelEstimator
 from Models.GPTModel import GPTModel
 from TextPreprocessing.gpt_bpe_tool import get_encoder, Encoder
 
 
 def train():
     model = GPTModel()
-    trainer = multi_gpu_trainer(device_id=[0], model_fn=model)
+    trainer = ModelEstimator(device_id=[0], model_fn=model)
     trainer.training(train_data_path='./data/my_s2s_test_data/train.tsv',
                      dev_data_path='./data/my_s2s_test_data/dev.tsv',
                      ckpt_dir='./data/my_s2s_models_adam/',
@@ -27,7 +27,7 @@ def test():
                              func_for_task_specific_preprocessing=model.process_origin_data_for_placeholders,
                              shuffle_each_epoch=False, round_feeding=False, in_tsv_mode=True)
     model.config['eos_id'] = data_stream.text_index_encoder.eos_id
-    my_estimator = multi_gpu_trainer(device_id=[0], model_fn=model)
+    my_estimator = ModelEstimator(device_id=[0], model_fn=model)
     result = my_estimator.inferring(data_stream=data_stream,
                                     ckpt_dir='./data/my_s2s_models_adam/',
                                     mini_batch=8, logging=True)

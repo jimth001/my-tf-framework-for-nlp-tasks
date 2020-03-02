@@ -30,7 +30,7 @@ from MyEstimator.DataStream import DataStream
 from typing import List, Dict, Any
 
 
-class multi_gpu_trainer:
+class ModelEstimator:
     def __init__(self, device_id: List[int], model_fn: ModelFn):
         self.config = {}
         self.config['device_id'] = device_id
@@ -43,7 +43,7 @@ class multi_gpu_trainer:
         self.model_fn = model_fn
         self.graph = tf.Graph()
         # vars for data parallel:
-        self.tower_grads = []
+        self.tower_grads = {}
         # vars for gradient accumlation:
         self.accum_vars = None
         self.accum_grad_ops = None
@@ -87,14 +87,24 @@ class multi_gpu_trainer:
             for i in range(0, len(self.config['device_id'])):
                 with tf.variable_scope(tf.get_variable_scope(), reuse=(i != 0)):
                     with tf.device('/gpu:%d' % self.config['device_id'][i]):
-                        with tf.name_scope('parallel_%d' % i) as scope:
+                        with tf.name_scope('parallel_%d' % i):
                             self.model_fn.create_placeholders(i)
-                            total_loss = self.model_fn.build_training_graph(group_id=i)
-                            grads = self.opt.compute_gradients(total_loss)
-                            self.tower_grads.append(grads)
+                            self.model_fn.build_training_graph(group_id=i)
+                            grads = nest.map_structure(lambda x: self.opt.compute_gradients(x),
+                                                       self.model_fn.losses_groups[i])
+                            for loss_name in grads.keys():
+                                if loss_name in self.tower_grads:
+                                    self.tower_grads[loss_name].append(grads[loss_name])
+                                else:
+                                    self.tower_grads[loss_name] = [grads[loss_name]]
             with tf.device('/gpu:0'):
-                grads = self.average_gradients(self.tower_grads)
-                self.train_step = self.opt.apply_gradients(grads, global_step=self.global_step)
+                grads = {}
+                self.train_step = {}
+                for loss_name in self.tower_grads.keys():
+                    grads[loss_name] = self.average_gradients(self.tower_grads[loss_name])
+                    self.train_step[loss_name] = self.opt.apply_gradients(grads[loss_name],
+                                                                          global_step=self.global_step)
+                self.accum_grad_ops = {}
                 if allow_gradient_accumulation:
                     tvs = tf.trainable_variables()
                     with tf.variable_scope(self.config['accum_var_scope']):
@@ -102,17 +112,21 @@ class multi_gpu_trainer:
                         self.accum_vars = [tf.Variable(tf.zeros_like(tv.initialized_value()), trainable=False)
                                            for tv in tvs]
                         self.zero_ops = [tv.assign(tf.zeros_like(tv)) for tv in self.accum_vars]
-                        self.accum_grad_ops = [self.accum_vars[j].assign_add(gv[0]) for j, gv in enumerate(grads)]
+                        last_name = None
+                        for loss_name in self.tower_grads.keys():
+                            self.accum_grad_ops[loss_name] = [self.accum_vars[j].assign_add(gv[0]) for j, gv in
+                                                              enumerate(grads[loss_name])]
+                            last_name = loss_name
                         self.train_accum_grad_step = self.opt.apply_gradients(
-                            [(self.accum_vars[j], gv[1]) for j, gv in enumerate(grads)], global_step=self.global_step)
-            with tf.device('/gpu:0'):
-                obvious_losses = self.model_fn.get_all_losses()
-                self.losses_to_report = {}
-                for key in obvious_losses.keys():
-                    self.losses_to_report[key] = tf.reduce_mean(tf.stack(obvious_losses[key], axis=0))
-                losses_name = [n for n, o in list(self.losses_to_report.items())]
-                losses_ops = [o for n, o in list(self.losses_to_report.items())]
-                self.losses_to_report = [losses_name, losses_ops]
+                            [(self.accum_vars[j], gv[1]) for j, gv in enumerate(grads[last_name])],
+                            global_step=self.global_step)
+                # losses_to_report contains losses_to_optimize and losses_to_only_watch:
+                self.losses_to_report = self.model_fn.get_items_group_by_name_from_by_id(self.model_fn.losses_groups)
+                self.losses_to_report.update(
+                    self.model_fn.get_items_group_by_name_from_by_id(self.model_fn.losses_only_watch_groups))
+                for loss_name in self.losses_to_report.keys():
+                    self.losses_to_report[loss_name] = tf.reduce_mean(
+                        tf.stack(self.losses_to_report[loss_name], axis=0))
 
     def build_data_parallel_inferring_graph(self):
         with self.graph.as_default():
@@ -121,10 +135,10 @@ class multi_gpu_trainer:
             for i in range(0, len(self.config['device_id'])):
                 with tf.variable_scope(tf.get_variable_scope(), reuse=(i != 0)):
                     with tf.device('/gpu:%d' % self.config['device_id'][i]):
-                        with tf.name_scope('parallel_%d' % i) as scope:
+                        with tf.name_scope('parallel_%d' % i):
                             self.model_fn.create_placeholders(i)
-                            pred = self.model_fn.build_inferring_graph(group_id=i)
-                            self.predictions_ops['beam_search_seqs'] = pred
+                            self.model_fn.build_inferring_graph(group_id=i)
+                            self.predictions_ops = self.model_fn.prediction_groups[i]
 
     def load_checkpoint(self, path, logging) -> Dict[str, Any]:
         """
@@ -267,48 +281,66 @@ class multi_gpu_trainer:
 
     def eval_for_one_dataset(self, sess: tf.Session, eval_data_stream: DataStream,
                              mini_batch: int, run_options=None):
-        device_num = len(self.config['device_id'])
-        with self.graph.as_default():
-            feed_dict = {}
-            data_num = eval_data_stream.dataset_size
-            assert data_num >= device_num, 'do not suppose this case: data_num<device_num'
-            # to allocate data for each gpu each step
-            yu = data_num % (mini_batch * device_num)
-            normal_steps = data_num // (mini_batch * device_num)
-            sp_steps_data_num = []
-            if yu != 0:
-                if yu < device_num:
-                    normal_steps -= 1
-                    for i in range(0, yu):
-                        sp_steps_data_num.append(mini_batch + 1)
-                    for i in range(yu, device_num):
-                        sp_steps_data_num.append(mini_batch)
-                else:
-                    sp_steps_data_num = [yu // device_num] * device_num
-                    for i in range(0, yu % device_num):
-                        sp_steps_data_num[i] += 1
-            # calculate losses
-            ret_losses = [0] * len(self.losses_to_report[0])
-            for i in range(0, normal_steps):
+        def eval_one_step(losses_to_fetch: Dict[str, Any]):
+            device_num = len(self.config['device_id'])
+            pls_for_op = {}
+            for op_name in losses_to_fetch:
+                pls_for_op[op_name] = self.model_fn.placeholder_requirement_for_losses[op_name]
+            with self.graph.as_default():
+                feed_dict = {}
+                data_num = eval_data_stream.dataset_size
+                assert data_num >= device_num, 'do not suppose this case: data_num<device_num'
+                # to allocate data for each gpu each step
+                yu = data_num % (mini_batch * device_num)
+                normal_steps = data_num // (mini_batch * device_num)
+                sp_steps_data_num = []
+                if yu != 0:
+                    if yu < device_num:
+                        normal_steps -= 1
+                        for i in range(0, yu):
+                            sp_steps_data_num.append(mini_batch + 1)
+                        for i in range(yu, device_num):
+                            sp_steps_data_num.append(mini_batch)
+                    else:
+                        sp_steps_data_num = [yu // device_num] * device_num
+                        for i in range(0, yu % device_num):
+                            sp_steps_data_num[i] += 1
+                # calculate losses
+                ret_losses = {}
+                for loss_name in losses_to_fetch.keys():
+                    ret_losses[loss_name] = 0
+                for i in range(0, normal_steps):
+                    feed_dict.clear()
+                    for j in range(0, device_num):
+                        feed_dict.update(eval_data_stream. \
+                                         get_feed_dict(self.model_fn.placeholder_groups[j],
+                                                       size=mini_batch,
+                                                       op_name_to_run_and_target_data_name=pls_for_op))
+                    result = sess.run(losses_to_fetch, feed_dict=feed_dict, options=run_options)
+                    for loss_name in losses_to_fetch.keys():
+                        ret_losses[loss_name] += result[loss_name] * device_num * mini_batch
                 feed_dict.clear()
                 for j in range(0, device_num):
-                    feed_dict.update(
-                        eval_data_stream.get_feed_dict(self.model_fn.placeholder_groups[j], size=mini_batch))
-                result = sess.run(self.losses_to_report[1], feed_dict=feed_dict, options=run_options)
-                for k in range(0, len(self.losses_to_report[0])):
-                    ret_losses[k] += result[k] * device_num * mini_batch
-            feed_dict.clear()
-            for j in range(0, device_num):
-                feed_dict.update(
-                    eval_data_stream.get_feed_dict(self.model_fn.placeholder_groups[j], size=sp_steps_data_num[j]))
-            result = sess.run(self.losses_to_report[1], feed_dict=feed_dict, options=run_options)
-            for k in range(0, len(self.losses_to_report[0])):
-                ret_losses[k] += result[k] * sum(sp_steps_data_num)
-            for k in range(0, len(self.losses_to_report[0])):
-                ret_losses[k] /= data_num
-        assert eval_data_stream.dataset_size == eval_data_stream.low, 'data allocation may be wrong'
-        eval_data_stream.reset_feeding_status()
-        return ret_losses
+                    feed_dict.update(eval_data_stream. \
+                                     get_feed_dict(self.model_fn.placeholder_groups[j],
+                                                   size=sp_steps_data_num[j],
+                                                   op_name_to_run_and_target_data_name=pls_for_op))
+                result = sess.run(losses_to_fetch, feed_dict=feed_dict, options=run_options)
+                for loss_name in losses_to_fetch.keys():
+                    ret_losses[loss_name] += result[loss_name] * sum(sp_steps_data_num)
+                for loss_name in losses_to_fetch.keys():
+                    ret_losses[loss_name] /= data_num
+            assert eval_data_stream.dataset_size == eval_data_stream.low, 'data allocation may be wrong'
+            eval_data_stream.reset_feeding_status()
+            return ret_losses
+
+        ret = {}
+        for losses_in_one_eval_step in self.model_fn.eval_steps:
+            d_losses = {}
+            for loss_name in losses_in_one_eval_step:
+                d_losses[loss_name] = self.losses_to_report[loss_name]
+            ret.update(eval_one_step(losses_to_fetch=d_losses))
+        return ret
 
     def predict_for_one_dataset(self, sess: tf.Session, test_data_stream: DataStream,
                                 mini_batch: int, run_options=None):
@@ -351,7 +383,7 @@ class multi_gpu_trainer:
         test_data_stream.reset_feeding_status()
         return ret_predictions
 
-    def training(self, train_data_path, dev_data_path, ckpt_dir,
+    def training(self, train_stream: DataStream, dev_stream: DataStream, ckpt_dir,
                  learning_rate=1e-4, batch_size=64, mini_batch=16, total_steps=100000,
                  eval_per_n_steps=1, max_to_save=3,
                  early_stop_steps=6000, pretrained_ckpt=None, is_tsv_mode=True):
@@ -359,12 +391,12 @@ class multi_gpu_trainer:
         assert batch_size % device_num == 0
         assert batch_size >= mini_batch * device_num and batch_size % (mini_batch * device_num) == 0
         # create datastream
-        train_stream = DataStream(train_data_path, placeholder_meta_data=self.model_fn.config['placeholders'],
-                                  func_for_task_specific_preprocessing=self.model_fn.process_origin_data_for_placeholders,
-                                  shuffle_each_epoch=True, round_feeding=True, in_tsv_mode=is_tsv_mode)
-        dev_stream = DataStream(dev_data_path, placeholder_meta_data=self.model_fn.config['placeholders'],
-                                func_for_task_specific_preprocessing=self.model_fn.process_origin_data_for_placeholders,
-                                shuffle_each_epoch=False, round_feeding=False, in_tsv_mode=is_tsv_mode)
+        # train_stream = DataStream(train_data_path, placeholder_meta_data=self.model_fn.config['placeholders'],
+        #                          func_for_task_specific_preprocessing=self.model_fn.process_origin_data_for_placeholders,
+        #                          shuffle_each_epoch=True, round_feeding=True, in_tsv_mode=is_tsv_mode)
+        # dev_stream = DataStream(dev_data_path, placeholder_meta_data=self.model_fn.config['placeholders'],
+        #                        func_for_task_specific_preprocessing=self.model_fn.process_origin_data_for_placeholders,
+        #                        shuffle_each_epoch=False, round_feeding=False, in_tsv_mode=is_tsv_mode)
         assert type(train_stream.text_index_encoder) == type(
             dev_stream.text_index_encoder), 'bpe tool must be same for train and dev'
         # set vocab size for modelfn
@@ -447,22 +479,13 @@ class multi_gpu_trainer:
             self.log_file.write(content.strip() + '\n')
             self.log_file.flush()
 
-    def get_obvious_loss_report(self, losses):
-        assert len(losses) == len(self.losses_to_report[0])
-        strings = ['{']
-        for i in range(0, len(losses)):
-            strings.append(self.losses_to_report[0][i])
-            strings.append(':')
-            strings.append(str(losses[i]))
-        strings.append('}')
-        return " ".join(strings)
+    def get_obvious_loss_report(self, losses: Dict[str, float]):
+        return str(losses)
 
     def new_losses_are_better(self, new_losses, old_losses):
         if old_losses is None:
             return True
-        losses_name = self.losses_to_report[0]
-        return self.model_fn.new_losses_are_better(new_losses=new_losses, old_losses=old_losses,
-                                                   losses_name=losses_name)
+        return self.model_fn.new_losses_are_better(new_losses=new_losses, old_losses=old_losses)
 
 
 def get_time_dif(start_time):
