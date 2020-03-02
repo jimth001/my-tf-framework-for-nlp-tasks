@@ -1,3 +1,4 @@
+# convert origin data into tsv format
 from TextPreprocessing.file_api import read_file_lines,write_file_lines
 
 base_path = '../data/my_s2s_test_data/'
