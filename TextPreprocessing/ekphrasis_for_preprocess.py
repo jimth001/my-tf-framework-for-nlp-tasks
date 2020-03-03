@@ -1,6 +1,17 @@
 from ekphrasis.classes.preprocessor import TextPreProcessor
 from ekphrasis.classes.tokenizer import SocialTokenizer
 from ekphrasis.dicts.emoticons import emoticons
+from TextPreprocessing.TextPreprocessor import TextPreprocessor
+
+
+class EkphrasisTextPreprocess(TextPreprocessor):
+    def __init__(self):
+        super(EkphrasisTextPreprocess, self).__init__(name='ekphrasis')
+        self.tool = get_text_processor()
+
+    def pre_process_doc(self, doc: str):
+        return self.tool.pre_process_doc(doc)
+
 
 def get_text_processor()->TextPreProcessor:
     text_processor = TextPreProcessor(
