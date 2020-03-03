@@ -4,6 +4,7 @@ import os
 import json
 import regex as re
 from functools import lru_cache
+from TextPreprocessing.TextIndexTranslator import TextIndexTranslator
 
 @lru_cache()
 def bytes_to_unicode():
@@ -39,7 +40,8 @@ def get_pairs(word):
         prev_char = char
     return pairs
 
-class Encoder:
+
+class Encoder(TextIndexTranslator):
     def __init__(self, encoder, bpe_merges, errors='replace', eos_flag='<|endoftext|>'):
         self.encoder = encoder
         self.decoder = {v:k for k,v in self.encoder.items()}
@@ -52,7 +54,7 @@ class Encoder:
         self.pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
         #yunli 20200226:
-        self.eos_id=self.encoder['<|endoftext|>']
+        super(Encoder, self).__init__(name='GPT', eos_id=self.encoder['<|endoftext|>'])
 
     def get_vocab_size(self):
         return len(self.encoder)
