@@ -4,7 +4,7 @@ import tensorflow as tf
 from collections import OrderedDict
 from enum import Enum
 import json
-from typing import List, Dict, Any, Collection, NoReturn
+from typing import List, Dict, Any, Collection, NoReturn, Set, Union
 
 
 class PlaceholderType(Enum):
@@ -15,6 +15,7 @@ class PlaceholderType(Enum):
     TextAttnMask = 5
     TextTargMask = 6
     BatchSize = 7
+    SpecialBatchInformation = 8
 
 
 class PlaceholderMetaData():
@@ -40,6 +41,38 @@ class PlaceholderMetaData():
 
 class ModelFn:
     def __init__(self):
+        """
+            A model could have n placeholders, m losses to optimize,
+            k losses to only watch, t predictions to output.
+            Every placeholder, loss, prediction should have a name.
+            Each loss requires x placeholders, which can be represented as {loss_name:[placeholder1,...]}.
+            Each prediction requires x placeholders, which can be represented as {loss_name:[placeholder1,...]}.
+
+            Different losses, predictions, optimize_ops may have conflicts so sometimes you can not running once to fetch all of them.
+            Although this is almost not to happen, we also provide a strategy to deal with it.
+            In eval stage, we apply an list named eval_steps to define how to eval all losses in n steps.
+                n=len(eval_steps)
+                eval_steps=[step1,step2,...stepn]
+                step_i is a list of losses
+                You can put conflict losses into different steps.
+                Notice that use more than 1 eval steps will cause additional computational overhead,
+                so you should use it only when necessary.
+            In training stage, similarly but differently, we also provide a "training_steps" list, where
+                training_steps=[batch_1_step,batch_2_step,...]
+                batch_1_step=[step1,step2,...]
+                step1=[loss1,...] ...
+                In training stage:
+                    for one_batch_steps in training_steps:
+                        produce one batch data
+                        for losses in one_batch_steps:
+                            split losses into can_be_optimized and only_watch
+                            then train(can_be_optimized,data) and fetch(only_watch,data)
+            In prediction stage, there is a list named "predicting_steps", similar to "eval_steps".
+
+            In training stage, we create a train_op for each optimized loss.
+            In training steps, if a loss is in self.losses_groups, ModelWrapper will run the corresponding train_op
+            and fetch the loss value, otherwise ModelWrapper will only fetch the loss value to display.
+        """
         # initialized when create placeholders
         self.placeholder_groups: Dict[int, Dict[str, tf.placeholder]] = OrderedDict()
         # initialized when building training graph
@@ -47,21 +80,17 @@ class ModelFn:
         # initialized when building training graph
         self.losses_only_watch_groups: Dict[int, Dict[str, any]] = OrderedDict()
         # initialized when building inference graph
+        # NOTICE that all prediction tensor should be batch first.
         self.prediction_groups: Dict[int, Dict[str, any]] = OrderedDict()
         # initialized when the object is constructed. self.init_check() can help to check some errors.
         self.placeholder_requirement_for_losses: Dict[str, List[str]] = {}
         self.placeholder_requirement_for_predictions: Dict[str, List[str]] = {}
         self.placeholders_meta_data: Dict[str, PlaceholderMetaData] = {}
-        self.training_steps: List[List[str]] = []  # [batch1=[ step1=loss1,step2=loss3,... ] ]
-        self.eval_steps: List[List[str]] = []  # [first_step=[loss1],second_step=[loss2]]
+        self.training_steps: List[List[List[str]]] = []  # [batch1=[ step1=loss1,step2=loss3,... ] ]
+        self.eval_steps: List[List[str]] = []  # [first_step=[loss1,loss3],second_step=[loss2]]
+        self.predicting_steps: List[List[str]] = []  # [first_step=[pred1,pred2],second_step=[pred3]]
         self.config: Dict[str, Any] = {}
-        """
-        A model could have n placeholders, m losses to optimize, 
-        k losses to only watch, t predictions to output.
-        Every placeholder, loss, prediction should have a name.
-        Each loss requires x placeholders, which can be represented as {loss_name:[placeholder1,...]}.
-        Each prediction requires x placeholders, which can be represented as {loss_name:[placeholder1,...]}.
-        """
+        # self.batch_train_steps_pointer = 0
 
     def check_after_init(self):
         # check if there are obvious errors after init.
@@ -82,6 +111,8 @@ class ModelFn:
         check_type_and_len(self.training_steps, list, 0)
         for batch_training_steps in self.training_steps:
             check_type_and_len(batch_training_steps, list, 0)
+            for one_step_losses in batch_training_steps:
+                check_type_and_len(one_step_losses, list, 0)
         # all required placeholders exist:
         required_placeholders_set = set()
         for loss_name in self.placeholder_requirement_for_losses.keys():
@@ -97,13 +128,15 @@ class ModelFn:
         # losses in training steps should exist in self.placeholder_requirement_for_losses:
         losses_in_training_steps = set()
         for batch_training_steps in self.training_steps:
-            for loss_name in batch_training_steps:
-                losses_in_training_steps.add(loss_name)
+            for one_step_losses in batch_training_steps:
+                for loss_name in one_step_losses:
+                    losses_in_training_steps.add(loss_name)
         losses_in_placeholder_requirement = set()
         for loss_name in self.placeholder_requirement_for_losses.keys():
             losses_in_placeholder_requirement.add(loss_name)
         for loss_name in losses_in_training_steps:
-            assert loss_name in losses_in_placeholder_requirement, "losses in training steps should exist in self.placeholder_requirement_for_losses"
+            assert loss_name in losses_in_placeholder_requirement, \
+                "losses \"%s\" in training steps should exist in self.placeholder_requirement_for_losses" % (loss_name)
         # different eval step can not have same losses, one eval step can not have same losses:
         tmp = set()
         for losses_in_one_eval_step in self.eval_steps:
@@ -143,7 +176,8 @@ class ModelFn:
         pass
 
     @abstractmethod
-    def merge_batch_prediction_result(self, new_batch_result: Dict[str, Any], previous_result: Dict[str, Any] or None):
+    def merge_batch_prediction_result(self, new_batch_result: Dict[str, Any],
+                                      previous_result: Union[Dict[str, Any], None]):
         pass
 
     @abstractmethod
@@ -154,11 +188,14 @@ class ModelFn:
     def new_losses_are_better(self, new_losses: Dict[str, float], old_losses: Dict[str, float]) -> bool:
         pass
 
+    def feed_dict_post_process(self, feed_dict: Dict, data_name_not_exist: Set[str]) -> Dict:
+        return feed_dict
+
     def create_placeholders(self, group_id: int) -> NoReturn:
         """an example of meta_dict: {'input':[dtype, shape, name]}"""
         one_group_placeholders = {}
-        for key in self.config['placeholders'].keys():
-            x = self.config['placeholders'][key]
+        for key in self.placeholders_meta_data.keys():
+            x = self.placeholders_meta_data[key]
             one_group_placeholders[key] = tf.placeholder(dtype=x.dtype, shape=x.shape, name=key + "_%d" % group_id)
         self.placeholder_groups[group_id] = one_group_placeholders
 

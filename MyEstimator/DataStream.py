@@ -1,12 +1,13 @@
-from TextPreprocessing.gpt_bpe_tool import get_encoder
-from TextPreprocessing.ekphrasis_for_preprocess import get_text_processor
 from tensorflow.python.keras.preprocessing.sequence import pad_sequences
 from MyEstimator.ModelFn import PlaceholderType, PlaceholderMetaData, ModelFn
 from collections import OrderedDict
-from typing import List, Dict
+from typing import List, Dict, Callable, Set, Union
 import random
 import os
 import tensorflow as tf
+from TextPreprocessing.TextIndexTranslator import TextIndexTranslator
+from TextPreprocessing.TextPreprocessor import TextPreprocessor
+from MyEstimator.utils import flatten_nested_list
 
 
 def load_txt_corpus(path, data_type: PlaceholderType):
@@ -42,6 +43,7 @@ def load_tsv_corpus(path, placeholders: Dict[str, PlaceholderMetaData]) -> Dict[
     :param path: the path of the tsv file
     :return: {placeholder_name1:List_1, ...}: A dict whose keys are placeholders' name, and the values are the data.
     """
+
     def convert_type(text_data, type):
         if type == PlaceholderType.Text:
             return text_data
@@ -75,10 +77,11 @@ class DataStream:
     To avoid confused configurations, DataStream will append EOS to each text.
     If some task do not need eos, drop it in func_for_task_specific_processing.
     """
+
     def __init__(self, files_base_path, placeholder_meta_data: Dict[str, PlaceholderMetaData],
                  *, func_for_task_specific_preprocessing: ModelFn.process_origin_data_for_placeholders,
-                 text2index_dictionary_path='./data/bpe_codes/', in_tsv_mode=True,
-                 text_preprocessor=get_text_processor(), text2index_tool=get_encoder,
+                 text_preprocessor: Union[TextPreprocessor, None], text2index_tool: TextIndexTranslator,
+                 in_tsv_mode=True,
                  shuffle_each_epoch=False, round_feeding=True):
         """
         :param files_base_path: For tsv mode. it is the path of tsv file; for txt mode, it is the parent directory of txt files.
@@ -110,7 +113,7 @@ class DataStream:
         self.dataset_size = max(dlen)
         # text preprocess and 2index:
         self.text_preprocessor = text_preprocessor
-        self.text_index_encoder = text2index_tool(text2index_dictionary_path)
+        self.text_index_encoder = text2index_tool
         self.append_eos = True  # do not change this. If you do not need eos, drop it in your modelfn.func_for_task_specific_processing
         for n in data.keys():
             if placeholder_meta_data[n].type == PlaceholderType.Text:
@@ -127,16 +130,16 @@ class DataStream:
         if self.shuffle_each_epoch:
             self.shuffle_data(self.processed_data)
         # whether to turn around
-        self.round_feeding=round_feeding
+        self.round_feeding = round_feeding
         # add config information for recording: todo make config inf more useful
         self.config = {}
         self.config['in_tsv_mode'] = in_tsv_mode
-        self.config['text_preprocessor'] = 'ekphrasis'
-        self.config['bpe_tool'] = 'gpt'
+        self.config['text_preprocessor'] = self.text_preprocessor.name if self.text_preprocessor is not None else 'None'
+        self.config['bpe_tool'] = self.text_index_encoder.name
 
     def reset_feeding_status(self):
-        self.epoch=1
-        self.low=0
+        self.epoch = 1
+        self.low = 0
 
     def shuffle_data(self, data: Dict[str, List]):
         aligned_data = []
@@ -160,7 +163,7 @@ class DataStream:
         else:
             return data
 
-    def text2index(self, data: List[str]):
+    def text2index(self, data: List[str]) -> List[List[int]]:
         indexes = []
         for l in data:
             if self.append_eos:
@@ -169,7 +172,7 @@ class DataStream:
                 indexes.append(self.text_index_encoder.encode(l))
         return indexes
 
-    def index2text(self, data: List[str]):
+    def index2text(self, data: List[List[int]]) -> List[str]:
         text = []
         for l in data:
             if self.append_eos:
@@ -184,7 +187,8 @@ class DataStream:
         return new_in, in_len
 
     def get_feed_dict(self, one_group_placeholders: Dict[str, tf.placeholder], size,
-                      op_name_to_run_and_target_data_name: Dict[str, List[str]]):
+                      op_name_to_run_and_target_data_name: Dict[str, List[str]],
+                      modelfn_post_process: Callable[[Dict, Set[str]], Dict]) -> Dict:
         """
         An example for helping understand what self.get_feed_dict do:
         :param one_group_placeholders: {data1:tf.placeholder,data2:tf.placeholder,data3:tf.placeholder,
@@ -203,19 +207,32 @@ class DataStream:
         """
         feed_dict = {}
         size_to_fetch = size
-        data_names_to_fetch = {}
-
-        for n in self.processed_data.keys():
+        data_names_to_fetch = [op_name_to_run_and_target_data_name[key] for key in
+                               op_name_to_run_and_target_data_name.keys()]
+        data_names_to_fetch = set([x for x in flatten_nested_list(data_names_to_fetch)])
+        data_included = set()
+        data_excluded = set()
+        for name in data_names_to_fetch:
+            if name in self.processed_data:
+                data_included.add(name)
+            else:
+                data_excluded.add(name)
+                assert self.placeholder_meta_data[name].type == PlaceholderType.SpecialBatchInformation or \
+                       self.placeholder_meta_data[name].type == PlaceholderType.BatchSize, \
+                    'type of %s is %s, should be %s or %s, or should be in self.processed_data' \
+                    % (name, self.placeholder_meta_data[name].type,
+                       PlaceholderType.BatchSize, PlaceholderType.SpecialBatchInformation)
+        for n in data_included:
             feed_dict[one_group_placeholders[n]] = []
         if self.round_feeding:
             while size > 0:
                 if self.low + size <= self.dataset_size:
-                    for n in self.processed_data.keys():
+                    for n in data_included:
                         feed_dict[one_group_placeholders[n]] += self.processed_data[n][self.low:self.low + size]
                     self.low += size
                     size = 0
                 else:
-                    for n in self.processed_data.keys():
+                    for n in data_included:
                         feed_dict[one_group_placeholders[n]] += self.processed_data[n][self.low:]
                     size = size - (self.dataset_size - self.low)
                     self.low = 0
@@ -223,26 +240,27 @@ class DataStream:
                     if self.shuffle_each_epoch:
                         self.shuffle_data(self.processed_data)
         else:
-            for n in self.processed_data.keys():
+            for n in data_included:
                 feed_dict[one_group_placeholders[n]] += self.processed_data[n][self.low:self.low + size]
-            self.low+=size
-            if self.low>=self.dataset_size:
-                self.epoch+=1
+            self.low += size
+            if self.low >= self.dataset_size:
+                self.epoch += 1
         # padding sequence:(len has been already calculated in func_for_task_specific_processing)
-        for key in self.processed_data.keys():
+        for key in data_included:
             if self.placeholder_meta_data[key].type == PlaceholderType.Text or \
                     self.placeholder_meta_data[key].type == PlaceholderType.TextTargMask or \
                     self.placeholder_meta_data[key].type == PlaceholderType.TextAttnMask:
-                feed_dict[one_group_placeholders[key]], _len = self.padding_batch(feed_dict[one_group_placeholders[key]])
-        # process for batch information, such as batch size:
-        for key in self.placeholder_meta_data.keys():
+                feed_dict[one_group_placeholders[key]], _len = self.padding_batch(
+                    feed_dict[one_group_placeholders[key]])
+        # process for batch information(Only batch size now, more task specific process should be done in modelfn.feed_dict_post_process):
+        for key in data_excluded:
             if self.placeholder_meta_data[key].type == PlaceholderType.BatchSize:
                 if self.low >= self.dataset_size:
                     batch_size = size_to_fetch - (self.dataset_size - self.low)
                 else:
                     batch_size = size_to_fetch
                 feed_dict[one_group_placeholders[key]] = batch_size
-        return feed_dict
+        return modelfn_post_process(feed_dict, data_excluded)
 
     def get_all_configs(self):
         # todo
