@@ -3,7 +3,7 @@ from MyEstimator.ModelFn import ModelFn, PlaceholderMetaData, PlaceholderType
 from DeepComponents.GPT import model
 from tensorflow.contrib.seq2seq import sequence_loss
 from DeepComponents.TransformerBlock import default_hparams
-from typing import List, Dict, Any, NoReturn
+from typing import List, Dict, Any, NoReturn, Union
 from DeepComponents.BeamSearch import create_inference_graph
 import numpy as np
 
@@ -26,11 +26,18 @@ class GPTModel(ModelFn):
                                                dtype=tf.float32),
             'batch_size': PlaceholderMetaData(PlaceholderType.BatchSize, Ref=None, shape=(), dtype=tf.int32)
         }
-        self.training_steps = [['gpt_lm_loss']]
+        self.training_steps = [[['gpt_lm_loss']]]
+        self.eval_steps = [['gpt_lm_loss']]
+        self.predicting_steps = [['pred_seq', 'pred_score']]
         self.placeholder_requirement_for_losses = {
-            'gpt_lm_loss': ['input', 'input_len', 'target', 'target_len', 'target_mask']}
+            'gpt_lm_loss': ['input', 'input_len', 'target', 'target_len', 'target_mask'],
+            # TMP: for test pipeline
+            'loss-1': ['input', 'input_len', 'target', 'target_len', 'target_mask'],
+            'loss+1': ['input', 'input_len', 'target', 'target_len', 'target_mask'],
+        }
         self.placeholder_requirement_for_predictions = {'pred_seq': ['input', 'input_len', 'batch_size'],
                                                         'pred_score': ['input', 'input_len', 'batch_size']}
+
         self.config['hparams'] = default_hparams()
         self.config['only_for_pretraining'] = False
 
@@ -56,6 +63,7 @@ class GPTModel(ModelFn):
     def build_inferring_graph(self, group_id) -> NoReturn:
         with tf.variable_scope(self.__class__.__name__) as m_scope:
             placeholders = self.placeholder_groups[group_id]
+
             def step_fn(hparam, tokens, past=None, scope=m_scope):
                 output = model(hparams=hparam, X=tokens, past=past, scope=scope, reuse=tf.AUTO_REUSE)
                 present = output['presents']
@@ -96,8 +104,8 @@ class GPTModel(ModelFn):
             new_data['target'] = [i[1:] + t for i, t in zip(data['input'], data['target'])]
         else:
             new_data['input'] = data['input']
-        for name in self.config['placeholders'].keys():
-            pl_meta: PlaceholderMetaData = self.config['placeholders'][name]
+        for name in self.placeholders_meta_data.keys():
+            pl_meta: PlaceholderMetaData = self.placeholders_meta_data[name]
             if pl_meta.Ref in data:
                 if pl_meta.type == PlaceholderType.TextLength:
                     ref_data: List = new_data[pl_meta.Ref]
@@ -127,7 +135,7 @@ class GPTModel(ModelFn):
         return d
 
     def merge_batch_prediction_result(self, new_batch_result: Dict[str, np.array],
-                                      previous_result: Dict[str, List] or None):
+                                      previous_result: Union[Dict[str, Any], None]):
         if previous_result is None:
             ret = {}
             for key in new_batch_result.keys():
