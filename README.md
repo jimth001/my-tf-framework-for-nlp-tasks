@@ -10,8 +10,8 @@ pipelines quickly for different nlp tasks.
 3.2. Flexible Running Control. You can fully and easily to control the training, inferring steps, such as to define a training cycle which has different losses to optimize for each step.
 With this feature, you can finish some "training-complex-model" (such as GAN, compared to a Classifier) easily and you do not need to implement a big function to control your training process.
 
-##Kernel Classes Introduction
-###1. ModelFn  
+## Kernel Classes Introduction
+### 1. ModelFn  
 The Base Class for your own models.  
 Define **Inputs**, **Losses to optimize**, **Losses to only watch**, **Predictions**, **Running Control** and the **TF Graph**.  
 A model could have n Inputs, m Losses to optimize, k Losses to only watch, t Predictions to output.  
@@ -46,12 +46,12 @@ and fetch the loss value, otherwise ModelWrapper will only fetch the loss value 
 
 In prediction stage, there is a list named "predicting_steps", similar to "eval_steps".
 
-###2. ModelWrapper
+### 2. ModelWrapper
 Implement multi-gpu running and gradient accumlation. 
 
-###3. DataStream
+### 3. DataStream
 Load data, preprocess and generate batch data.
 
-##Get Started
+## Get Started
 We apply a simple example in Models.GPTModel, and test functions are in main.py.  
 
