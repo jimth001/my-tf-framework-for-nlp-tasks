@@ -26,7 +26,7 @@ def train():
     trainer.training(train_stream, dev_stream,
                      ckpt_dir='./data/my_s2s_models_test/',
                      learning_rate=1e-4, batch_size=16, mini_batch=8,
-                     total_steps=100, eval_per_n_steps=1, max_to_save=1,
+                     total_steps=250, eval_per_n_steps=10, max_to_save=1,
                      early_stop_steps=500,
                      pretrained_ckpt='./data/gpt2_pre_trained_model/')
 
@@ -47,7 +47,7 @@ def test():
     model.check_after_init()
     my_estimator = ModelEstimator(device_id=[0], model_fn=model)
     result = my_estimator.inferring(data_stream=data_stream,
-                                    ckpt_dir='./data/my_s2s_models_adam/',
+                                    ckpt_dir='./data/my_s2s_models_test/',
                                     mini_batch=8, logging=False)
     result = result['pred_seq']
     for one in result:
@@ -71,5 +71,5 @@ def test_build_training_inferring_graph_simultaneously():
 
 
 if __name__ == '__main__':
-    train()
+    test()
     print('test finished')
