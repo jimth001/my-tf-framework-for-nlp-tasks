@@ -58,6 +58,7 @@ def conv1d(x, scope, nf, *, w_init_stdev=0.02):
         c = tf.reshape(tf.matmul(tf.reshape(x, [-1, nx]), tf.reshape(w, [-1, nf])) + b, start + [nf])
         return c
 
+
 def attn(x, scope, n_state, *, past, hparams, src_seq_mask=None):
     """src_seq_len : [batch size, seq_len]"""
     assert x.shape.ndims == 3  # Should be [batch, sequence, features]
@@ -76,9 +77,9 @@ def attn(x, scope, n_state, *, past, hparams, src_seq_mask=None):
     def mask_attn_weights(w):
         # w has shape [batch, heads, dst_sequence, src_sequence], where information flows from src to dst.
         if src_seq_mask is None:
-            b=left_to_right_attention_mask(from_tensor=w, to_tensor=w, dtype=w.dtype)
+            b = left_to_right_attention_mask(from_tensor=w, to_tensor=w, dtype=w.dtype)
         else:
-            b=padding_attention_mask(from_tensor=w, to_mask=src_seq_mask, dtype=w.dtype)
+            b = padding_attention_mask(from_tensor=w, to_mask=src_seq_mask, dtype=w.dtype)
         w = w * b - tf.cast(1e10, w.dtype) * (1 - b)
         return w
 
