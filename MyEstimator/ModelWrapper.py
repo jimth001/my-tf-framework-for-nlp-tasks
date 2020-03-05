@@ -406,16 +406,17 @@ class ModelEstimator:
                     result = sess.run(fetch_dict, feed_dict=feed_dict, options=run_options)
                     for loss_name in losses_to_fetch:
                         ret_losses[loss_name] += result[loss_name] * device_num * mini_batch
-                feed_dict.clear()
-                for j in range(0, device_num):
-                    feed_dict.update(eval_data_stream. \
-                                     get_feed_dict(model_fn.placeholder_groups[j],
-                                                   size=sp_steps_data_num[j],
-                                                   op_name_to_run_and_target_data_name=pls_for_op,
-                                                   modelfn_post_process=model_fn.feed_dict_post_process))
-                result = sess.run(fetch_dict, feed_dict=feed_dict, options=run_options)
-                for loss_name in losses_to_fetch:
-                    ret_losses[loss_name] += result[loss_name] * sum(sp_steps_data_num)
+                if yu != 0:
+                    feed_dict.clear()
+                    for j in range(0, device_num):
+                        feed_dict.update(eval_data_stream. \
+                                         get_feed_dict(model_fn.placeholder_groups[j],
+                                                       size=sp_steps_data_num[j],
+                                                       op_name_to_run_and_target_data_name=pls_for_op,
+                                                       modelfn_post_process=model_fn.feed_dict_post_process))
+                    result = sess.run(fetch_dict, feed_dict=feed_dict, options=run_options)
+                    for loss_name in losses_to_fetch:
+                        ret_losses[loss_name] += result[loss_name] * sum(sp_steps_data_num)
                 for loss_name in losses_to_fetch:
                     ret_losses[loss_name] /= data_num
             assert eval_data_stream.dataset_size == eval_data_stream.low, 'data allocation may be wrong'
@@ -480,14 +481,15 @@ class ModelEstimator:
                                                            modelfn_post_process=model_fn.feed_dict_post_process))
                     result = sess.run(fetch_dict, feed_dict=feed_dict, options=run_options)
                     ret_predictions = model_fn.merge_batch_prediction_result(result, ret_predictions)
-                feed_dict.clear()
-                for j in range(0, device_num):
-                    feed_dict.update(
-                        test_data_stream.get_feed_dict(model_fn.placeholder_groups[j], size=sp_steps_data_num[j],
-                                                       op_name_to_run_and_target_data_name=pls_for_op,
-                                                       modelfn_post_process=model_fn.feed_dict_post_process))
-                result = sess.run(fetch_dict, feed_dict=feed_dict, options=run_options)
-                ret_predictions = model_fn.merge_batch_prediction_result(result, ret_predictions)
+                if yu != 0:
+                    feed_dict.clear()
+                    for j in range(0, device_num):
+                        feed_dict.update(
+                            test_data_stream.get_feed_dict(model_fn.placeholder_groups[j], size=sp_steps_data_num[j],
+                                                           op_name_to_run_and_target_data_name=pls_for_op,
+                                                           modelfn_post_process=model_fn.feed_dict_post_process))
+                    result = sess.run(fetch_dict, feed_dict=feed_dict, options=run_options)
+                    ret_predictions = model_fn.merge_batch_prediction_result(result, ret_predictions)
             assert test_data_stream.dataset_size == test_data_stream.low, 'data allocation may be wrong'
             test_data_stream.reset_feeding_status()
             return ret_predictions
