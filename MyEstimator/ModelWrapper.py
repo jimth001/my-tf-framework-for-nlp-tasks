@@ -27,7 +27,7 @@ import os
 from typing import List
 from tensorflow.contrib import opt as optimizers_set
 from MyEstimator.DataStream import DataStream
-from typing import List, Dict, Any, Set, Tuple
+from typing import List, Dict, Any, Set, Tuple, Union
 from MyEstimator.utils import flatten_nested_list
 
 
@@ -259,7 +259,7 @@ class ModelEstimator:
                 self.saver.save(sess, os.path.join(ckpt_dir, self.model_fn.__class__.__name__), global_step=step)
 
     def train_one_batch(self, sess, train_data_stream: DataStream,
-                        batch_size: int, mini_batch: int, train_steps_for_this_batch: List[List[str]],
+                        batch_size: int, mini_batch: Union[int, List[int]], train_steps_for_this_batch: List[List[str]],
                         run_options=None) -> Tuple[Dict[str, float], Dict[str, int]]:
         """
         train one batch, with multi gpus and grad accum
@@ -267,14 +267,20 @@ class ModelEstimator:
         :param sess: tensorflow session
         :param train_data_stream: confirms that feed batch_size data to the model
         :param batch_size: data num for this training step
-        :param mini_batch: num of data which is feeded to one gpu every time.
+        :param mini_batch: num of data which is feeded to gpus every time.
         :param train_steps_for_this_batch
         :param run_options: tensorflow running options
         :return:
         """
         # batchsize=minibatch*devicenum*k
         device_num = len(self.config['device_id'])
-        accum_steps = batch_size // (mini_batch * device_num)
+        if isinstance(mini_batch, int):
+            accum_steps = batch_size // (mini_batch * device_num)
+            sample_num_list_for_one_training_step_for_each_gpu = [mini_batch] * device_num
+        else:
+            sample_num_for_one_training_step_on_all_gpus = sum(mini_batch)
+            accum_steps = batch_size // sample_num_for_one_training_step_on_all_gpus
+            sample_num_list_for_one_training_step_for_each_gpu = mini_batch
         all_losses_in_this_batch = set([x for x in flatten_nested_list(train_steps_for_this_batch)])
         all_needed_pls = {}
         for loss_name in all_losses_in_this_batch:
@@ -283,7 +289,8 @@ class ModelEstimator:
         for i in range(0, accum_steps):
             tmp = {}
             for j in range(0, device_num):
-                tmp.update(train_data_stream.get_feed_dict(self.model_fn.placeholder_groups[j], size=mini_batch,
+                tmp.update(train_data_stream.get_feed_dict(self.model_fn.placeholder_groups[j],
+                                                           size=sample_num_list_for_one_training_step_for_each_gpu[j],
                                                            op_name_to_run_and_target_data_name=all_needed_pls,
                                                            modelfn_post_process=self.model_fn.feed_dict_post_process))
             all_feed_data.append(tmp)
@@ -349,7 +356,7 @@ class ModelEstimator:
         return ret_losses, losses_occurance
 
     def eval_for_one_dataset(self, sess: tf.Session, eval_data_stream: DataStream,
-                             mini_batch: int, run_options=None) -> Dict[str, float]:
+                             mini_batch: Union[int, List[int]], run_options=None) -> Dict[str, float]:
         """
         eval on one dataset
         fetch all losses in model_fn.eval_steps
@@ -364,17 +371,23 @@ class ModelEstimator:
         device_num = len(self.config['device_id'])
         data_num = eval_data_stream.dataset_size
         assert data_num >= device_num, 'do not suppose this case: data_num<device_num'
+        if isinstance(mini_batch, int):
+            sample_num_for_one_training_step_on_all_gpus = device_num * mini_batch
+            sample_num_list_for_one_training_step_for_each_gpu = [mini_batch] * device_num
+        else:
+            sample_num_for_one_training_step_on_all_gpus = sum(mini_batch)
+            sample_num_list_for_one_training_step_for_each_gpu = mini_batch
         # to allocate data for each gpu each step
-        yu = data_num % (mini_batch * device_num)
-        normal_steps = data_num // (mini_batch * device_num)
+        yu = data_num % sample_num_for_one_training_step_on_all_gpus
+        normal_steps = data_num // sample_num_for_one_training_step_on_all_gpus
         sp_steps_data_num = []
         if yu != 0:
             if yu < device_num:
                 normal_steps -= 1
                 for i in range(0, yu):
-                    sp_steps_data_num.append(mini_batch + 1)
+                    sp_steps_data_num.append(sample_num_list_for_one_training_step_for_each_gpu[i] + 1)
                 for i in range(yu, device_num):
-                    sp_steps_data_num.append(mini_batch)
+                    sp_steps_data_num.append(sample_num_list_for_one_training_step_for_each_gpu[i])
             else:
                 sp_steps_data_num = [yu // device_num] * device_num
                 for i in range(0, yu % device_num):
@@ -400,12 +413,12 @@ class ModelEstimator:
                     for j in range(0, device_num):
                         feed_dict.update(eval_data_stream. \
                                          get_feed_dict(model_fn.placeholder_groups[j],
-                                                       size=mini_batch,
+                                                       size=sample_num_list_for_one_training_step_for_each_gpu[j],
                                                        op_name_to_run_and_target_data_name=pls_for_op,
                                                        modelfn_post_process=model_fn.feed_dict_post_process))
                     result = sess.run(fetch_dict, feed_dict=feed_dict, options=run_options)
                     for loss_name in losses_to_fetch:
-                        ret_losses[loss_name] += result[loss_name] * device_num * mini_batch
+                        ret_losses[loss_name] += result[loss_name] * sample_num_for_one_training_step_on_all_gpus
                 if yu != 0:
                     feed_dict.clear()
                     for j in range(0, device_num):
@@ -429,7 +442,7 @@ class ModelEstimator:
         return ret
 
     def predict_for_one_dataset(self, sess: tf.Session, test_data_stream: DataStream,
-                                mini_batch: int, run_options=None):
+                                mini_batch: Union[int, List[int]], run_options=None):
         """
         predict for one dataset
         fetch all predictions in model_fn.predicting_steps
@@ -442,17 +455,23 @@ class ModelEstimator:
         device_num = len(self.config['device_id'])
         data_num = test_data_stream.dataset_size
         assert data_num >= device_num, 'do not suppose this case: data_num<device_num'
+        if isinstance(mini_batch, int):
+            sample_num_for_one_training_step_on_all_gpus = device_num * mini_batch
+            sample_num_list_for_one_training_step_for_each_gpu = [mini_batch] * device_num
+        else:
+            sample_num_for_one_training_step_on_all_gpus = sum(mini_batch)
+            sample_num_list_for_one_training_step_for_each_gpu = mini_batch
         # to allocate data for each gpu each step
-        yu = data_num % (mini_batch * device_num)
-        normal_steps = data_num // (mini_batch * device_num)
+        yu = data_num % sample_num_for_one_training_step_on_all_gpus
+        normal_steps = data_num // sample_num_for_one_training_step_on_all_gpus
         sp_steps_data_num = []
         if yu != 0:
             if yu < device_num:
                 normal_steps -= 1
                 for i in range(0, yu):
-                    sp_steps_data_num.append(mini_batch + 1)
+                    sp_steps_data_num.append(sample_num_list_for_one_training_step_for_each_gpu[i] + 1)
                 for i in range(yu, device_num):
-                    sp_steps_data_num.append(mini_batch)
+                    sp_steps_data_num.append(sample_num_list_for_one_training_step_for_each_gpu[i])
             else:
                 sp_steps_data_num = [yu // device_num] * device_num
                 for i in range(0, yu % device_num):
@@ -476,7 +495,8 @@ class ModelEstimator:
                     feed_dict.clear()
                     for j in range(0, device_num):
                         feed_dict.update(
-                            test_data_stream.get_feed_dict(model_fn.placeholder_groups[j], size=mini_batch,
+                            test_data_stream.get_feed_dict(model_fn.placeholder_groups[j],
+                                                           size=sample_num_list_for_one_training_step_for_each_gpu[j],
                                                            op_name_to_run_and_target_data_name=pls_for_op,
                                                            modelfn_post_process=model_fn.feed_dict_post_process))
                     result = sess.run(fetch_dict, feed_dict=feed_dict, options=run_options)
@@ -498,13 +518,40 @@ class ModelEstimator:
             return_data.update(predict_one_step(set(predictions_of_one_step)))
         return return_data
 
-    def training(self, train_stream: DataStream, dev_stream: DataStream, ckpt_dir,
-                 learning_rate=1e-4, batch_size=64, mini_batch=16, total_steps=100000,
-                 eval_per_n_steps=1, max_to_save=3,
-                 early_stop_steps=6000, pretrained_ckpt=None):
+    def training(self, train_stream: DataStream, dev_stream: DataStream, ckpt_dir: str,
+                 learning_rate: float = 1e-4, batch_size: int = 64, mini_batch: Union[int, List[int]] = 16,
+                 total_steps: int = 100000, eval_per_n_steps: int = 1, max_to_save: int = 3,
+                 early_stop_steps: int = 6000, pretrained_ckpt: Union[None, str] = None,
+                 save_without_eval: bool = False):
+        """
+        training
+        :param train_stream:
+        :param dev_stream:
+        :param ckpt_dir:
+        :param learning_rate:
+        :param batch_size:
+        :param mini_batch: Because gradient accumulation vars are stored on one gpu, you may need distribute different
+                            amount of samples for different gpus, for load balancing. Of course, you can set it as an int
+                            to distribute same amount of data for the gpus.
+        :param total_steps:
+        :param eval_per_n_steps:
+        :param max_to_save:
+        :param early_stop_steps:
+        :param pretrained_ckpt:
+        :param save_without_eval: If you do not want to eval on a small dataset, just saving by training performance,
+                                   set it be True (may be required when you pre-train something), otherwise set it be False.
+        :return: None
+        """
         device_num = len(self.config['device_id'])
-        assert batch_size % device_num == 0
-        assert batch_size >= mini_batch * device_num and batch_size % (mini_batch * device_num) == 0
+        assert isinstance(mini_batch, (int, list))
+        if isinstance(mini_batch, int):
+            assert batch_size % device_num == 0
+            assert batch_size >= mini_batch * device_num and batch_size % (mini_batch * device_num) == 0
+            sample_num_for_one_training_step_on_all_gpus = device_num * mini_batch
+        else:
+            assert device_num == len(mini_batch)
+            assert batch_size >= sum(mini_batch) and batch_size % sum(mini_batch) == 0
+            sample_num_for_one_training_step_on_all_gpus = sum(mini_batch)
         assert type(train_stream.text_index_encoder) == type(
             dev_stream.text_index_encoder), 'bpe tool must be same for train and dev'
         # set vocab size for modelfn
@@ -515,7 +562,7 @@ class ModelEstimator:
         if not os.path.exists(ckpt_dir):
             os.makedirs(ckpt_dir)
         self.log_file = open(ckpt_dir + 'log-%s.txt' % (get_time_stamp()), 'w', encoding='utf-8')
-        if batch_size == mini_batch * len(self.config['device_id']):
+        if batch_size == sample_num_for_one_training_step_on_all_gpus:
             self.build_data_parallel_training_graph(allow_gradient_accumulation=False)
         else:
             self.build_data_parallel_training_graph(allow_gradient_accumulation=True)
@@ -558,33 +605,65 @@ class ModelEstimator:
                 train_loss[name] /= train_loss_occur[name]
             ###eval:
             if step % eval_per_n_steps == 0:
-                eval_loss = self.eval_for_one_dataset(sess, dev_stream, mini_batch=mini_batch, run_options=run_options)
-                time_dif = get_time_dif(start_time)
-                if self.new_losses_are_better(new_losses=eval_loss, old_losses=best_loss):
-                    best_loss = eval_loss
-                    last_improvement_step = step
-                    self.print_and_logging('save step %d' % last_improvement_step)
-                    self.save_model(sess, ckpt_dir=ckpt_dir, step=step)
-                    saved_steps.append(last_improvement_step)
-                    self.print_and_logging("%s: step %d: *\ntrain loss: %s *\neval loss: %s *" %
+                if not save_without_eval:
+                    eval_loss = self.eval_for_one_dataset(sess, dev_stream, mini_batch=mini_batch,
+                                                          run_options=run_options)
+                    time_dif = get_time_dif(start_time)
+                    if self.new_losses_are_better(new_losses=eval_loss, old_losses=best_loss):
+                        best_loss = eval_loss
+                        last_improvement_step = step
+                        self.print_and_logging('save step %d' % last_improvement_step)
+                        self.save_model(sess, ckpt_dir=ckpt_dir, step=step)
+                        saved_steps.append(last_improvement_step)
+                        self.print_and_logging("%s: step %d: *\ntrain loss: %s *\neval loss: %s *" %
                                            (time_dif, step, self.get_obvious_loss_report(train_loss),
                                             self.get_obvious_loss_report(eval_loss)))
-                    if len(saved_steps) > max_to_save:
-                        saved_steps = saved_steps[1:]
+                        if len(saved_steps) > max_to_save:
+                            saved_steps = saved_steps[1:]
+                    else:
+                        self.print_and_logging("%s: step %d:\ntrain loss: %s\neval loss: %s" %
+                                           (time_dif, step, self.get_obvious_loss_report(train_loss),
+                                            self.get_obvious_loss_report(eval_loss)))
+                        if step - last_improvement_step > early_stop_steps:
+                            self.print_and_logging("early stopping...")
+                            break
                 else:
-                    self.print_and_logging("%s: step %d:\ntrain loss: %s\neval loss: %s" %
-                                           (time_dif, step, self.get_obvious_loss_report(train_loss),
-                                            self.get_obvious_loss_report(eval_loss)))
-                    if step - last_improvement_step > early_stop_steps:
-                        self.print_and_logging("early stopping...")
-                        break
+                    time_dif = get_time_dif(start_time)
+                    if self.new_losses_are_better(new_losses=train_loss, old_losses=best_loss):
+                        best_loss = train_loss
+                        last_improvement_step = step
+                        self.print_and_logging('save step %d' % last_improvement_step)
+                        self.save_model(sess, ckpt_dir=ckpt_dir, step=step)
+                        saved_steps.append(last_improvement_step)
+                        self.print_and_logging("%s: step %d: *\ntrain loss: %s *" %
+                                               (time_dif, step, self.get_obvious_loss_report(train_loss)))
+                        if len(saved_steps) > max_to_save:
+                            saved_steps = saved_steps[1:]
+                    else:
+                        self.print_and_logging("%s: step %d:\ntrain loss: %s" %
+                                               (time_dif, step, self.get_obvious_loss_report(train_loss)))
+                        if step - last_improvement_step > early_stop_steps:
+                            self.print_and_logging("early stopping...")
+                            break
             ###
             step += 1
         print('all work has finished')
 
-    def inferring(self, data_stream: DataStream, ckpt_dir, mini_batch=16, logging=False):
+    def inferring(self, data_stream: DataStream, ckpt_dir, mini_batch: Union[int, List[int]] = 16, logging=False):
+        """
+        inferring
+        :param data_stream:
+        :param ckpt_dir:
+        :param mini_batch:
+        :param logging: if true, generate a log.txt with time stamp.
+        :return:
+        """
         assert os.path.exists(ckpt_dir)
         assert tf.train.latest_checkpoint(ckpt_dir) is not None
+        assert isinstance(mini_batch, (int, list))
+        if not isinstance(mini_batch, int):
+            device_num = len(self.config['device_id'])
+            assert device_num == len(mini_batch)
         if logging:
             self.log_file = open(ckpt_dir + 'infer_log-%s.txt' % (get_time_stamp()), 'w', encoding='utf-8')
         # set vocab size for modelfn

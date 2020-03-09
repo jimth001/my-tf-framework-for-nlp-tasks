@@ -40,7 +40,7 @@ def test():
     model.config['decode_alpha'] = 0.6
     text2index_dictionary_path = './data/bpe_codes/'
     bpe_tool = get_encoder(text2index_dictionary_path)
-    data_stream = DataStream('./data/arithmetic/dev.tsv', placeholder_meta_data=model.placeholders_meta_data,
+    data_stream = DataStream('./data/arithmetic/test.tsv', placeholder_meta_data=model.placeholders_meta_data,
                              func_for_task_specific_preprocessing=model.process_origin_data_for_placeholders,
                              text_preprocessor=None,
                              text2index_tool=bpe_tool,
@@ -73,6 +73,6 @@ def test_build_training_inferring_graph_simultaneously():
 
 
 if __name__ == '__main__':
-    train()
-    #test()
+    # train()
+    test()
     print('test finished')
